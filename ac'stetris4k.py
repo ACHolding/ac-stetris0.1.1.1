@@ -54,6 +54,15 @@ NES_GRAVITY = {
 MAX_LEVEL = 256
 LINES_PER_LEVEL = 10
 
+# NES palette scramble for level-256 kill-screen glitch
+_GLITCH_COLORS = (
+    (116, 116, 116), (0, 0, 252), (148, 0, 132), (168, 0, 32), (168, 16, 0),
+    (0, 120, 0), (0, 64, 88), (188, 188, 188), (0, 120, 248), (104, 68, 252),
+    (216, 0, 204), (228, 0, 88), (248, 56, 0), (0, 184, 0), (248, 248, 248),
+    (60, 188, 252), (248, 120, 248), (248, 184, 0), (88, 216, 84), (0, 232, 216),
+    PIECE_COLORS['T'], PIECE_COLORS['Z'], PIECE_COLORS['O'], PIECE_COLORS['I'],
+)
+
 # --- Korobeiniki (Tetris Type A) — gameplay BGM only, no external files ---
 SR = 44100
 NES_CPU = 1789773.0
@@ -193,6 +202,27 @@ def _play_level_fanfare() -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+# Kill-screen burst when max level is reached (embedded, no external files)
+_GLITCH_FANFARE = (
+    (84, 40), (55, 30), (91, 40), (48, 30), (96, 50), (44, 35), (72, 60), (36, 80),
+)
+
+
+def _play_glitch_fanfare() -> None:
+    if not pygame.mixer.get_init():
+        return
+
+    def _run() -> None:
+        for midi, ms in _GLITCH_FANFARE:
+            pitch = midi + random.randint(-5, 5)
+            _play_tone(pitch, ms, 0.55, duty=random.choice((0.12, 0.25, 0.5)))
+            if random.random() < 0.6:
+                _play_tone(max(40, pitch - 19), ms, 0.3, triangle=True)
+            time.sleep(ms / 1000.0 * random.uniform(0.5, 0.95))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 class TetrisMusic:
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -320,8 +350,48 @@ class TetrisEngine:
         self.das_repeat = 6  # Frames between auto-repeats
         
         self.fall_frame_counter = 0
+        self.glitch_frame = 0
+        self.glitch_offset = (0, 0)
         self.current_piece = self.get_new_piece()
         self.next_piece = self.get_new_piece()
+
+    def _is_kill_glitch(self) -> bool:
+        return self.level >= MAX_LEVEL
+
+    def _glitch_color(self, row: int, col: int, base):
+        if not self._is_kill_glitch():
+            return base
+        if base is None:
+            return None
+        return _GLITCH_COLORS[(row * 5 + col * 11 + self.glitch_frame // 3) % len(_GLITCH_COLORS)]
+
+    def _tick_kill_glitch(self) -> None:
+        if not self._is_kill_glitch() or self.game_over:
+            return
+        self.glitch_frame += 1
+        if self.glitch_frame % 4 == 0:
+            self.glitch_offset = (random.randint(-8, 8), random.randint(-3, 3))
+        if self.glitch_frame % 40 == 0:
+            for _ in range(random.randint(1, 5)):
+                gr = random.randint(0, GRID_ROWS - 1)
+                gc = random.randint(0, GRID_COLS - 1)
+                if self.grid[gr][gc] is None:
+                    self.grid[gr][gc] = random.choice(_GLITCH_COLORS)
+        if self.current_piece and self.glitch_frame % 10 == 0:
+            self.current_piece.color = random.choice(_GLITCH_COLORS)
+        if self.next_piece and self.glitch_frame % 14 == 0:
+            self.next_piece.color = random.choice(_GLITCH_COLORS)
+
+    def _glitch_ui_text(self, label: str, value: str) -> str:
+        if not self._is_kill_glitch() or self.glitch_frame % 18 >= 10:
+            return value
+        if label == "LEVEL":
+            return random.choice(("256", "000", "029", "255", "ERR", "???"))
+        digits = "0123456789"
+        return "".join(
+            random.choice(digits) if random.random() < 0.45 else ch
+            for ch in value
+        )
 
     def _start_bgm(self) -> None:
         _get_bgm().start()
@@ -405,7 +475,10 @@ class TetrisEngine:
         new_level = min(MAX_LEVEL, self.lines_cleared // LINES_PER_LEVEL + 1)
         if new_level > self.level:
             self.level = new_level
-            _play_level_fanfare()
+            if new_level >= MAX_LEVEL:
+                _play_glitch_fanfare()
+            else:
+                _play_level_fanfare()
         else:
             self.level = new_level
 
@@ -502,6 +575,7 @@ class TetrisEngine:
             self.das_counter = 0
 
     def update_game_logic(self):
+        self._tick_kill_glitch()
         self.fall_frame_counter += 1
         keys = pygame.key.get_pressed()
         
@@ -576,34 +650,56 @@ class TetrisEngine:
         pygame.display.flip()
 
     def draw_game(self):
-        self.screen.fill(COLOR_BG)
+        bg = random.choice(_GLITCH_COLORS[:8]) if self._is_kill_glitch() and self.glitch_frame % 30 < 3 else COLOR_BG
+        self.screen.fill(bg)
+
+        ox, oy = self.glitch_offset if self._is_kill_glitch() else (0, 0)
+        board_x = GRID_X_OFFSET + ox
+        board_y = GRID_Y_OFFSET + oy
         
         # Draw Active Grid Background Area
-        pygame.draw.rect(self.screen, COLOR_GRID_BG, (GRID_X_OFFSET, GRID_Y_OFFSET, GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE))
+        pygame.draw.rect(self.screen, COLOR_GRID_BG, (board_x, board_y, GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE))
         
         # Render Locked Grid Blocks
         for r in range(GRID_ROWS):
             for c in range(GRID_COLS):
-                color = self.grid[r][c]
-                rect = pygame.Rect(GRID_X_OFFSET + c * BLOCK_SIZE, GRID_Y_OFFSET + r * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
+                color = self._glitch_color(r, c, self.grid[r][c])
+                rect = pygame.Rect(board_x + c * BLOCK_SIZE, board_y + r * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
                 if color:
                     pygame.draw.rect(self.screen, color, rect)
                     pygame.draw.rect(self.screen, COLOR_GRID_BG, rect, 1) # inner block border
                 else:
-                    pygame.draw.rect(self.screen, COLOR_GRID_LINE, rect, 1)
+                    line_color = COLOR_GRID_LINE
+                    if self._is_kill_glitch() and (r + c + self.glitch_frame) % 17 == 0:
+                        line_color = random.choice(_GLITCH_COLORS)
+                    pygame.draw.rect(self.screen, line_color, rect, 1)
 
         # Render Active Controlled Piece
         if not self.game_over and self.current_piece:
+            piece_color = self.current_piece.color
+            if self._is_kill_glitch():
+                piece_color = _GLITCH_COLORS[(self.glitch_frame // 2) % len(_GLITCH_COLORS)]
             for r, row in enumerate(self.current_piece.image):
                 for c, val in enumerate(row):
                     if val:
-                        pixel_x = GRID_X_OFFSET + (self.current_piece.x + c) * BLOCK_SIZE
-                        pixel_y = GRID_Y_OFFSET + (self.current_piece.y + r) * BLOCK_SIZE
+                        pixel_x = board_x + (self.current_piece.x + c) * BLOCK_SIZE
+                        pixel_y = board_y + (self.current_piece.y + r) * BLOCK_SIZE
                         # Draw only if inside top bounding block space
-                        if pixel_y >= GRID_Y_OFFSET:
+                        if pixel_y >= GRID_Y_OFFSET - 8:
                             rect = pygame.Rect(pixel_x, pixel_y, BLOCK_SIZE, BLOCK_SIZE)
-                            pygame.draw.rect(self.screen, self.current_piece.color, rect)
+                            pygame.draw.rect(self.screen, piece_color, rect)
                             pygame.draw.rect(self.screen, COLOR_GRID_BG, rect, 1)
+
+        if self._is_kill_glitch():
+            for sy in range(board_y, board_y + GRID_ROWS * BLOCK_SIZE, 4):
+                if (sy + self.glitch_frame) % 8 == 0:
+                    pygame.draw.line(
+                        self.screen,
+                        random.choice(_GLITCH_COLORS),
+                        (board_x, sy),
+                        (board_x + GRID_COLS * BLOCK_SIZE, sy),
+                        1,
+                    )
 
         # Render UI Sidebar Information panels
         self.draw_ui_panel()
@@ -625,26 +721,36 @@ class TetrisEngine:
         pygame.display.flip()
 
     def draw_ui_panel(self):
+        ui_glitch = self._is_kill_glitch() and self.glitch_frame % 24 < 6
+        text_color = random.choice(_GLITCH_COLORS) if ui_glitch else COLOR_TEXT
+        muted_color = random.choice(_GLITCH_COLORS) if ui_glitch else COLOR_TEXT_MUTED
+
         # Score Panel
-        score_lbl = self.font_ui.render("SCORE", True, COLOR_TEXT_MUTED)
-        score_val = self.font_menu.render(f"{self.score:06d}", True, COLOR_TEXT)
+        score_lbl = self.font_ui.render("SCORE", True, muted_color)
+        score_val = self.font_menu.render(
+            self._glitch_ui_text("SCORE", f"{self.score:06d}"), True, text_color
+        )
         self.screen.blit(score_lbl, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 20))
         self.screen.blit(score_val, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 50))
         
         # Lines Panel
-        lines_lbl = self.font_ui.render("LINES", True, COLOR_TEXT_MUTED)
-        lines_val = self.font_menu.render(f"{self.lines_cleared:03d}", True, COLOR_TEXT)
+        lines_lbl = self.font_ui.render("LINES", True, muted_color)
+        lines_val = self.font_menu.render(
+            self._glitch_ui_text("LINES", f"{self.lines_cleared:03d}"), True, text_color
+        )
         self.screen.blit(lines_lbl, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 130))
         self.screen.blit(lines_val, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 160))
 
         # Level Panel
-        lvl_lbl = self.font_ui.render("LEVEL", True, COLOR_TEXT_MUTED)
-        lvl_val = self.font_menu.render(f"{self.level:03d}", True, COLOR_TEXT)
+        lvl_lbl = self.font_ui.render("LEVEL", True, muted_color)
+        lvl_val = self.font_menu.render(
+            self._glitch_ui_text("LEVEL", f"{self.level:03d}"), True, text_color
+        )
         self.screen.blit(lvl_lbl, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 240))
         self.screen.blit(lvl_val, (GRID_X_OFFSET - 180, GRID_Y_OFFSET + 270))
 
         # Next Piece Panel
-        next_lbl = self.font_ui.render("NEXT", True, COLOR_TEXT_MUTED)
+        next_lbl = self.font_ui.render("NEXT", True, muted_color)
         next_box_x = GRID_X_OFFSET + (GRID_COLS * BLOCK_SIZE) + 50
         next_box_y = GRID_Y_OFFSET + 20
         self.screen.blit(next_lbl, (next_box_x, next_box_y))
@@ -655,13 +761,16 @@ class TetrisEngine:
         
         if self.next_piece:
             m = self.next_piece.rotations[0]
+            preview_color = self.next_piece.color
+            if self._is_kill_glitch():
+                preview_color = _GLITCH_COLORS[(self.glitch_frame // 3) % len(_GLITCH_COLORS)]
             for r, row in enumerate(m):
                 for c, val in enumerate(row):
                     if val:
                         # Center layout configuration inside preview square
                         p_x = next_box_x + 20 + c * BLOCK_SIZE
                         p_y = next_box_y + 50 + r * BLOCK_SIZE
-                        pygame.draw.rect(self.screen, self.next_piece.color, (p_x, p_y, BLOCK_SIZE, BLOCK_SIZE))
+                        pygame.draw.rect(self.screen, preview_color, (p_x, p_y, BLOCK_SIZE, BLOCK_SIZE))
                         pygame.draw.rect(self.screen, COLOR_GRID_BG, (p_x, p_y, BLOCK_SIZE, BLOCK_SIZE), 1)
 
 
